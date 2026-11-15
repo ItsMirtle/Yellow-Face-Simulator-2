@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yellow Face Simulator</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// stuff menu controls
+let gravity = 1600;
+let blobness = 0.2;
+let showFace = true;
+let outlineScale = 1.0;
+const outlineColor = "#000";
+let showMenu = true;
+let wallInset = 0;
+let solidity = 0;
+let mitosis = false;
+let rainbowMode = false;
+
+// mitosis: a grabbed blob/yellow face splits once its stretched past splitStretch * diameter for splitHold ticks
+const splitStretch = 1.35;
+const splitHold = 8;
+const minSplitRadius = 18;
+const maxBlobs = 2763;
+const startRadius = 90;
+
+const N = 40; // points per blob
+const EPS = 0.0001;
+// circle of radius 1, same point order as in Blob
+const UNIT_X = Float64Array.from({ length: N }, (_, i) => Math.sin(i / N * Math.PI * 2));
+const UNIT_Y = Float64Array.from({ length: N }, (_, i) => -Math.cos(i / N * Math.PI * 2));
+const SUBSTEPS = 3;
+const DT = 1 / 60 / SUBSTEPS;
+const MAX_SPEED = 30; // max speed per substep
+const perimIters = 5;
+const PIN_WEIGHT = 1000; // pinned points count way more when a solid blob refits
+
+const PANEL_W = 280;
+const POP_W = 200; // popup size
+const POP_H = 134;
+const GRAY = "rgb(128,128,128)";
+const BLUE = "rgb(0,76,140)";
+const BLUE_HOVER = "rgb(18,100,175)";
+const BLUE_ON = "rgb(30,144,255)";
+const BLUE_ON_HOVER = "rgb(75,165,255)";
+const RED = "rgb(230,0,0)";
+const RED_HOVER = "rgb(255,45,45)";
+const DIM_TEXT = "rgb(140,155,178)";
+const FONT = "Helvetica, Arial, sans-serif";
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let width = 0, height = 0, dpr = 1;
+
+const blobs = [];
+let grabbed = null;
+let individual = false; // individual editing toggle, shows the popups
+let grabIndex = 0;
+let grabOffX = 0, grabOffY = 0;
+let stretchTimer = 0;
+let mouseX = 0, mouseY = 0;
+let uiScale = 1;
+let frameCount = 0;
+let typed = "";
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const lerp = (a, b, t) => a + (b - a) * t;
+const constrain = (v, a, b) => Math.min(Math.max(v, a), b);
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+
+// hsb in 0-1, gives back rgb 0-255
+function hsb(h, s, v) {
+  h = (h % 1) * 6;
+  const i = Math.floor(h);
+  const f = h - i;
+  const p = v * (1 - s);
+  const q = v * (1 - s * f);
+  const t = v * (1 - s * (1 - f));
+  let r, g, b;
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q;
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+const css = (c) => "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+
+
+class Slider {
+  constructor(label, x, y, w, minV, maxV, value, fmt) {
+    this.label = label;
+    this.x = x;
+    this.y = y;
+    this.w = w;
+    this.minV = minV;
+    this.maxV = maxV;
+    this.value = value;
+    this.defaultValue = value;
+    this.fmt = fmt;
+    this.dragging = false;
+    this.rainbow = false;
+  }
+
+  reset() {
+    this.value = this.defaultValue;
+  }
+
+  hit(mx, my) {
+    return mx > this.x - 8 && mx < this.x + this.w + 8 && my > this.y - 14 && my < this.y + 14;
+  }
+
+  setFromMouse(mx) {
+    const t = (mx - this.x) / this.w;
+    this.value = constrain(this.minV + t * (this.maxV - this.minV), this.minV, this.maxV);
+  }
+
+  text() {
+    if (this.fmt === "pct") return Math.round(this.value * 100) + "%";
+    if (this.fmt === "px") return Math.round(this.value) + "px";
+    return String(Math.round(this.value));
+  }
+
+  display() {
+    const hx = this.x + this.w * (this.value - this.minV) / (this.maxV - this.minV);
+
+    if (this.rainbow) {
+      const g = ctx.createLinearGradient(this.x, 0, this.x + this.w, 0);
+      for (let i = 0; i <= 6; i++) g.addColorStop(i / 6, css(hsb(i / 6, 1, 1)));
+      ctx.fillStyle = g;
+      ctx.fillRect(this.x, this.y - 4, this.w, 8);
+    } else {
+      ctx.fillStyle = "rgb(60,60,60)";
+      ctx.fillRect(this.x, this.y - 2, this.w, 4);
+    }
+
+    ctx.fillStyle = BLUE;
+    ctx.fillRect(hx - 6, this.y - 13, 12, 26);
+
+    ctx.font = "15px " + FONT;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const label = this.label + ": " + this.text();
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    ctx.strokeText(label, this.x + this.w / 2, this.y + 1);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(label, this.x + this.w / 2, this.y + 1);
+  }
+}
+
+class Button {
+  constructor(label, x, y, w, h, kind) {
+    this.label = label;
+    this.x = x;
+    this.y = y;
+    this.w = w;
+    this.h = h;
+    this.kind = kind;
+    this.on = false;
+  }
+
+  over(mx, my) {
+    return mx > this.x && mx < this.x + this.w && my > this.y && my < this.y + this.h;
+  }
+
+  display() {
+    const hover = this.over(mouseX / uiScale, mouseY / uiScale);
+    let fill, text;
+    if (this.kind === "red") {
+      fill = hover ? RED_HOVER : RED;
+      text = "#fff";
+    } else if (this.kind === "toggle" && this.on) {
+      fill = hover ? BLUE_ON_HOVER : BLUE_ON;
+      text = "#fff";
+    } else {
+      fill = hover ? BLUE_HOVER : BLUE;
+      text = DIM_TEXT;
+    }
+    ctx.fillStyle = fill;
+    ctx.fillRect(this.x, this.y, this.w, this.h);
+    ctx.fillStyle = text;
+    ctx.font = "16px " + FONT;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(this.label, this.x + this.w / 2, this.y + this.h / 2 + 1);
+  }
+}
+
+const sBlob = new Slider("blobness", 16, 277, 248, 0, 1, blobness, "pct");
+const sGrav = new Slider("gravity", 16, 309, 248, 0, 3000, gravity, "num");
+const sOutline = new Slider("outline", 16, 341, 248, 0, 2, outlineScale, "pct");
+const sWalls = new Slider("shrink walls", 16, 373, 248, 0, 200, wallInset, "px");
+const sSolid = new Slider("solidity", 16, 405, 248, 0, 1, 0, "pct");
+
+const sSize = new Slider("size", 16, 459, 248, 30, 180, 80, "px");
+const sHue = new Slider("hue", 16, 491, 248, 0, 1, 0.55, "pct");
+sHue.rainbow = true;
+const sSat = new Slider("saturation", 16, 523, 248, 0, 1, 0.8, "pct");
+const sBri = new Slider("brightness", 16, 555, 248, 0, 1, 1.0, "pct");
+
+const sBgHue = new Slider("hue", 16, 609, 248, 0, 1, 0.6, "pct");
+sBgHue.rainbow = true;
+const sBgSat = new Slider("saturation", 16, 641, 248, 0, 1, 0, "pct");
+const sBgBri = new Slider("brightness", 16, 673, 248, 0, 1, 0, "pct");
+
+const sliders = [sBlob, sGrav, sOutline, sWalls, sSolid, sSize, sHue, sSat, sBri, sBgHue, sBgSat, sBgBri];
+
+const bAdd = new Button("add blob", 16, 16, 248, 34, "red");
+const bRemove = new Button("remove last", 16, 56, 120, 30, "blue");
+const bClear = new Button("clear all", 144, 56, 120, 30, "red");
+const bFace = new Button("face", 16, 92, 120, 30, "toggle");
+const bMitosis = new Button("mitosis", 144, 92, 120, 30, "toggle");
+const bFull = new Button("fullscreen", 16, 128, 120, 30, "blue");
+const bHide = new Button("hide menu", 144, 128, 120, 30, "blue");
+const bIndividual = new Button("individual editing", 16, 164, 248, 30, "toggle");
+const bReset = new Button("reset settings", 16, 691, 248, 34, "red");
+const bShow = new Button("menu", 10, 10, 76, 30, "blue");
+const buttons = [bAdd, bRemove, bClear, bFace, bMitosis, bFull, bHide, bIndividual, bReset];
+bFace.on = true;
+
+const newColor = () => hsb(sHue.value, sSat.value, sBri.value);
+const bgColor = () => hsb(sBgHue.value, sBgSat.value, sBgBri.value);
+
+
+class Blob {
+  constructor(cx, cy, r, col) {
+    // verlet, so no velocity anywhere, its just x - xLast
+    this.x = new Float64Array(N);
+    this.y = new Float64Array(N);
+    this.xLast = new Float64Array(N);
+    this.yLast = new Float64Array(N);
+
+    this.fx = new Float64Array(N);
+    this.fy = new Float64Array(N);
+    this.len = new Float64Array(N);
+    this.nx = new Float64Array(N);
+    this.ny = new Float64Array(N);
+
+    this.radius = r;
+    this.col = col;
+
+    // own settings from the popup, null = follows the side menu
+    this.own = null;
+    this.pop = null; // popup stuff, gets made the first time individual editing goes on
+    this.pinned = new Uint8Array(N);
+    this.px = new Float64Array(N);
+    this.py = new Float64Array(N);
+
+    for (let i = 0; i < N; i++) {
+      const ang = i / N * Math.PI * 2;
+      this.x[i] = cx + Math.sin(ang) * r;
+      this.y[i] = cy - Math.cos(ang) * r;
+      this.xLast[i] = this.x[i];
+      this.yLast[i] = this.y[i];
+    }
+    this.sideLength = dist(this.x[0], this.y[0], this.x[1], this.y[1]);
+    this.areaTarget = this.getArea();
+  }
+
+  integrate() {
+    const g = pick(this, "gravity", gravity) * DT * DT;
+    for (let i = 0; i < N; i++) {
+      // 0.998 = tiny bit of drag
+      let vx = (this.x[i] - this.xLast[i]) * 0.998;
+      let vy = (this.y[i] - this.yLast[i]) * 0.998;
+      const sp = Math.sqrt(vx * vx + vy * vy);
+      if (sp > MAX_SPEED) {
+        vx *= MAX_SPEED / sp;
+        vy *= MAX_SPEED / sp;
+      }
+      this.xLast[i] = this.x[i];
+      this.yLast[i] = this.y[i];
+      this.x[i] += vx;
+      this.y[i] += vy + g;
+    }
+  }
+
+  fixPerimeter() {
+    // blobness 0 is stiff, 1 is floppy
+    const relax = 0.95 + (0.15 - 0.95) * pick(this, "blobness", blobness);
+    const x = this.x, y = this.y, fx = this.fx, fy = this.fy;
+    for (let j = 0; j < perimIters; j++) {
+      for (let i = 0; i < N; i++) {
+        const next = (i + 1) % N;
+        const dx = x[next] - x[i];
+        const dy = y[next] - y[i];
+        let d = Math.sqrt(dx * dx + dy * dy);
+        if (d < EPS) d = 1.0;
+        const ratio = 1.0 - this.sideLength / d;
+        fx[i] += 0.5 * relax * dx * ratio;
+        fy[i] += 0.5 * relax * dy * ratio;
+        fx[next] -= 0.5 * relax * dx * ratio;
+        fy[next] -= 0.5 * relax * dy * ratio;
+      }
+      for (let i = 0; i < N; i++) {
+        x[i] += fx[i];
+        y[i] += fy[i];
+        fx[i] = 0;
+        fy[i] = 0;
+      }
+    }
+  }
+
+  keepArea() {
+    const x = this.x, y = this.y, len = this.len, nx = this.nx, ny = this.ny;
+    let perimeter = 0;
+    for (let i = 0; i < N; i++) {
+      const next = (i + 1) % N;
+      const dx = x[next] - x[i];
+      const dy = y[next] - y[i];
+      len[i] = Math.sqrt(dx * dx + dy * dy);
+      if (len[i] < EPS) len[i] = 1.0;
+      nx[i] = dy / len[i];
+      ny[i] = -dx / len[i];
+      perimeter += len[i];
+    }
+
+    // push in/out so the area goes back to what it was
+    const deltaArea = this.areaTarget - this.getArea();
+    const push = 0.5 * deltaArea / perimeter;
+
+    for (let i = 0; i < N; i++) {
+      const next = (i + 1) % N;
+      x[next] += push * (nx[i] + nx[next]);
+      y[next] += push * (ny[i] + ny[next]);
+    }
+  }
+
+  // shape matching, pulls everything toward a circle thats placed where the blob is now
+  holdShape() {
+    const s = pick(this, "solidity", solidity);
+    if (s <= 0) return;
+    const x = this.x, y = this.y, r = this.radius, pin = this.pinned;
+
+    // pins weigh a ton so the circle swings around them
+    let m = 0, cx = 0, cy = 0, c0x = 0, c0y = 0;
+    for (let i = 0; i < N; i++) {
+      const w = pin[i] ? PIN_WEIGHT : 1;
+      m += w;
+      cx += x[i] * w;
+      cy += y[i] * w;
+      c0x += UNIT_X[i] * r * w;
+      c0y += UNIT_Y[i] * r * w;
+    }
+    cx /= m;
+    cy /= m;
+    c0x /= m;
+    c0y /= m;
+
+    let dot = 0, cross = 0;
+    for (let i = 0; i < N; i++) {
+      const w = pin[i] ? PIN_WEIGHT : 1;
+      const qx = UNIT_X[i] * r - c0x, qy = UNIT_Y[i] * r - c0y;
+      const px = x[i] - cx, py = y[i] - cy;
+      dot += w * (qx * px + qy * py);
+      cross += w * (qx * py - qy * px);
+    }
+    const ang = Math.atan2(cross, dot);
+    const cs = Math.cos(ang), sn = Math.sin(ang);
+
+    for (let i = 0; i < N; i++) {
+      const qx = UNIT_X[i] * r - c0x, qy = UNIT_Y[i] * r - c0y;
+      const tx = cx + qx * cs - qy * sn;
+      const ty = cy + qx * sn + qy * cs;
+      x[i] += (tx - x[i]) * s;
+      y[i] += (ty - y[i]) * s;
+    }
+  }
+
+  popup() {
+    if (this.pop === null) {
+      const w = POP_W - 24;
+      this.pop = {
+        x: 0, y: 0, ready: false,
+        sliders: [
+          new Slider("blobness", 0, 0, w, 0, 1, 0, "pct"),
+          new Slider("gravity", 0, 0, w, 0, 3000, 0, "num"),
+          new Slider("outline", 0, 0, w, 0, 2, 0, "pct"),
+          new Slider("solidity", 0, 0, w, 0, 1, 0, "pct"),
+        ],
+      };
+    }
+    return this.pop;
+  }
+
+  hasPin() {
+    return this.pinned.includes(1);
+  }
+
+  // last thing every substep, puts pinned points back and kills their speed
+  keepPins() {
+    for (let i = 0; i < N; i++) {
+      if (!this.pinned[i]) continue;
+      this.x[i] = this.xLast[i] = this.px[i];
+      this.y[i] = this.yLast[i] = this.py[i];
+    }
+  }
+
+  drawPins() {
+    for (let i = 0; i < N; i++) {
+      if (!this.pinned[i]) continue;
+      ctx.beginPath();
+      ctx.arc(this.px[i], this.py[i], 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#fff";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#000";
+      ctx.stroke();
+    }
+  }
+
+  getArea() {
+    const x = this.x, y = this.y;
+    let area = x[N - 1] * y[0] - x[0] * y[N - 1];
+    for (let i = 0; i < N - 1; i++) {
+      area += x[i] * y[i + 1] - x[i + 1] * y[i];
+    }
+    return area * 0.5;
+  }
+
+  collideWithWalls() {
+    const left = wallInset;
+    const right = width - wallInset;
+    const top = wallInset;
+    const floorY = height - wallInset;
+    for (let i = 0; i < N; i++) {
+      if (this.x[i] < left) this.x[i] = left;
+      else if (this.x[i] > right) this.x[i] = right;
+      if (this.y[i] < top) this.y[i] = top;
+      if (this.y[i] > floorY) {
+        this.y[i] = floorY;
+        this.xLast[i] = this.x[i]; // floor friction, kinda
+      }
+    }
+  }
+
+  contains(px, py) {
+    const x = this.x, y = this.y;
+    // point in polygon (ray cast)
+    let inside = false;
+    for (let i = 0, j = N - 1; i < N; j = i++) {
+      if ((y[i] > py) !== (y[j] > py)) {
+        const crossX = (x[j] - x[i]) * (py - y[i]) / (y[j] - y[i]) + x[i];
+        if (px < crossX) inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  reachFrom(i) {
+    let best = 0;
+    for (let j = 0; j < N; j++) {
+      const dx = this.x[i] - this.x[j];
+      const dy = this.y[i] - this.y[j];
+      const d2 = dx * dx + dy * dy;
+      if (d2 > best) best = d2;
+    }
+    return Math.sqrt(best);
+  }
+
+  outlineWeight() {
+    return Math.max(2, this.radius * 0.06) * pick(this, "outline", outlineScale);
+  }
+
+  display(index) {
+    const x = this.x, y = this.y;
+    ctx.beginPath();
+    ctx.moveTo(x[0], y[0]);
+    for (let i = 1; i < N; i++) ctx.lineTo(x[i], y[i]);
+    ctx.closePath();
+
+    if (rainbowMode) {
+      // slow diagonal rainbow, loops every 1.8s. blobs are offset so theyre not all the same
+      const phase = performance.now() / 1800 + index * 0.17;
+      let cx = 0, cy = 0;
+      for (let i = 0; i < N; i++) {
+        cx += x[i];
+        cy += y[i];
+      }
+      cx /= N;
+      cy /= N;
+      const r = this.radius;
+      const g = ctx.createLinearGradient(cx + r, cy - r, cx - r, cy + r);
+      for (let i = 0; i <= 24; i++) g.addColorStop(i / 24, css(hsb(i / 24 + phase, 1, 1)));
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = css(this.col);
+    }
+    ctx.fill();
+
+    const w = this.outlineWeight();
+    if (w > 0.05) {
+      ctx.strokeStyle = outlineColor;
+      ctx.lineWidth = w;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+    }
+    if (showFace) this.drawFace();
+  }
+
+  drawFace() {
+    const x = this.x, y = this.y;
+    const w = this.outlineWeight();
+    if (w <= 0.05) return;
+    ctx.strokeStyle = outlineColor;
+    ctx.lineWidth = w;
+    ctx.lineCap = "round";
+
+    // face is placed with outline point numbers, only works with N = 40
+    const a = 36, b = 1, c = 23, d = 18;
+    const eyeTop = 0.09;
+    const eyeBottom = 0.15;
+    ctx.beginPath();
+    ctx.moveTo(lerp(x[a], x[c], eyeTop), lerp(y[a], y[c], eyeTop));
+    ctx.lineTo(lerp(x[a], x[c], eyeBottom), lerp(y[a], y[c], eyeBottom));
+    ctx.moveTo(lerp(x[b], x[d], eyeTop), lerp(y[b], y[d], eyeTop));
+    ctx.lineTo(lerp(x[b], x[d], eyeBottom), lerp(y[b], y[d], eyeBottom));
+    ctx.stroke();
+
+    const m1 = 33, m2 = 24, m3 = 14, m4 = 4;
+    const startX = lerp(x[m1], x[m2], 0.4);
+    const startY = lerp(y[m1], y[m2], 0.4);
+    const endX = lerp(x[m4], x[m3], 0.4);
+    const endY = lerp(y[m4], y[m3], 0.4);
+
+    const lx = lerp(x[m1], x[m2], 0.7);
+    const ly = lerp(y[m1], y[m2], 0.7);
+    const rx = lerp(x[m4], x[m3], 0.7);
+    const ry = lerp(y[m4], y[m3], 0.7);
+
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    ctx.bezierCurveTo(lerp(lx, rx, 0.2), lerp(ly, ry, 0.2),
+                      lerp(lx, rx, 0.7), lerp(ly, ry, 0.7),
+                      endX, endY);
+    ctx.stroke();
+  }
+}
+
+function addBlob(cx, cy, r, col) {
+  if (blobs.length >= maxBlobs) return;
+  blobs.push(new Blob(cx, cy, r, col));
+}
+
+function addRandomBlob() {
+  const r = sSize.value;
+  addBlob(rand(PANEL_W + 30, width - r), wallInset + r + 20, r, newColor());
+}
+
+
+function pushOut(a, b) {
+  // box check first, the loop below is slow
+  if (!boxesOverlap(a, b)) return;
+
+  for (let i = 0; i < N; i++) {
+    const px = a.x[i];
+    const py = a.y[i];
+    if (!b.contains(px, py)) continue;
+
+    let best = -1;
+    let bestT = 0;
+    let bestDist = 999999;
+    let bestX = 0, bestY = 0;
+
+    for (let j = 0; j < N; j++) {
+      const k = (j + 1) % N;
+      const ex = b.x[k] - b.x[j];
+      const ey = b.y[k] - b.y[j];
+      const l2 = ex * ex + ey * ey;
+      if (l2 < EPS) continue;
+      const t = constrain(((px - b.x[j]) * ex + (py - b.y[j]) * ey) / l2, 0, 1);
+      const qx = b.x[j] + ex * t;
+      const qy = b.y[j] + ey * t;
+      const dd = (qx - px) * (qx - px) + (qy - py) * (qy - py);
+      if (dd < bestDist) {
+        bestDist = dd;
+        best = j;
+        bestT = t;
+        bestX = qx;
+        bestY = qy;
+      }
+    }
+    if (best < 0) continue;
+
+    const mx = (bestX - px) * 0.5;
+    const my = (bestY - py) * 0.5;
+    const k = (best + 1) % N;
+    a.x[i] += mx;
+    a.y[i] += my;
+    b.x[best] -= mx * (1 - bestT);
+    b.y[best] -= my * (1 - bestT);
+    b.x[k] -= mx * bestT;
+    b.y[k] -= my * bestT;
+  }
+}
+
+function boxesOverlap(a, b) {
+  return Math.min(...a.x) <= Math.max(...b.x) && Math.max(...a.x) >= Math.min(...b.x)
+      && Math.min(...a.y) <= Math.max(...b.y) && Math.max(...a.y) >= Math.min(...b.y);
+}
+
+
+function pullGrabbed() {
+  const targetX = mouseX + grabOffX;
+  const targetY = mouseY + grabOffY;
+
+  let dx = (targetX - grabbed.x[grabIndex]) * 0.3;
+  let dy = (targetY - grabbed.y[grabIndex]) * 0.3;
+
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d > 25) {
+    dx *= 25 / d;
+    dy *= 25 / d;
+  }
+
+  // solidity makes the drag act on the whole blob like one rigid thing
+  // dragging toward/away from the center just moves it, sideways also spins it
+  const s = pick(grabbed, "solidity", solidity);
+  const gx = grabbed.x, gy = grabbed.y;
+  let cx = 0, cy = 0;
+  for (let i = 0; i < N; i++) {
+    cx += gx[i];
+    cy += gy[i];
+  }
+  cx /= N;
+  cy /= N;
+
+  let tx = dx, ty = dy, ang = 0;
+  const lx = gx[grabIndex] - cx, ly = gy[grabIndex] - cy;
+  const arm2 = lx * lx + ly * ly;
+  if (arm2 > EPS) {
+    const arm = Math.sqrt(arm2);
+    const ux = lx / arm, uy = ly / arm;
+    const along = dx * ux + dy * uy;
+    const across = dy * ux - dx * uy;
+    const r2 = grabbed.radius * grabbed.radius;
+    const share = r2 / (r2 + arm2);
+    tx = along * ux - across * share * uy;
+    ty = along * uy + across * share * ux;
+    ang = arm * across / (r2 + arm2);
+  }
+  const cs = Math.cos(ang), sn = Math.sin(ang);
+
+  for (let i = 0; i < N; i++) {
+    const gap = Math.abs(i - grabIndex);
+    const k = Math.min(gap, N - gap);
+    const near = k <= 3 ? 1.0 - k / 4.0 : 0;
+    const px = gx[i] - cx, py = gy[i] - cy;
+    const rigidX = tx + px * cs - py * sn - px;
+    const rigidY = ty + px * sn + py * cs - py;
+    gx[i] += (1 - s) * near * dx + s * rigidX;
+    gy[i] += (1 - s) * near * dy + s * rigidY;
+  }
+}
+
+function blobUnderMouse() {
+  for (let i = blobs.length - 1; i >= 0; i--) {
+    if (blobs[i].contains(mouseX, mouseY)) return blobs[i];
+  }
+  return null;
+}
+
+
+function checkMitosis() {
+  if (grabbed === null || blobs.length >= maxBlobs || grabbed.radius < minSplitRadius || grabbed.hasPin()) {
+    stretchTimer = 0;
+    return;
+  }
+
+  // distance from the held point to the farthest point
+  if (grabbed.reachFrom(grabIndex) > splitStretch * 2 * grabbed.radius) stretchTimer++;
+  else stretchTimer = 0;
+
+  if (stretchTimer >= splitHold) {
+    stretchTimer = 0;
+    split(blobs.indexOf(grabbed));
+  }
+}
+
+function split(index) {
+  if (index < 0) return;
+  const b = blobs[index];
+
+  let p = 0, q = 1;
+  let best = 0;
+  for (let i = 0; i < N; i++) {
+    for (let j = i + 1; j < N; j++) {
+      const dx = b.x[i] - b.x[j];
+      const dy = b.y[i] - b.y[j];
+      const d2 = dx * dx + dy * dy;
+      if (d2 > best) {
+        best = d2;
+        p = i;
+        q = j;
+      }
+    }
+  }
+  const len = Math.sqrt(best);
+  if (len < EPS) return;
+  const ux = (b.x[q] - b.x[p]) / len;
+  const uy = (b.y[q] - b.y[p]) / len;
+  const midX = (b.x[p] + b.x[q]) / 2;
+  const midY = (b.y[p] + b.y[q]) / 2;
+
+  let ax = 0, ay = 0, bx = 0, by = 0;
+  let na = 0, nb = 0;
+  let vx = 0, vy = 0;
+  for (let i = 0; i < N; i++) {
+    const side = (b.x[i] - midX) * ux + (b.y[i] - midY) * uy;
+    if (side < 0) {
+      ax += b.x[i];
+      ay += b.y[i];
+      na++;
+    } else {
+      bx += b.x[i];
+      by += b.y[i];
+      nb++;
+    }
+    vx += b.x[i] - b.xLast[i];
+    vy += b.y[i] - b.yLast[i];
+  }
+  if (na === 0 || nb === 0) return;
+  ax /= na; ay /= na;
+  bx /= nb; by /= nb;
+  vx /= N; vy /= N;
+
+  // half the area each so radius * 0.7071
+  const r = b.radius * 0.7071;
+  const lo = wallInset + r;
+  const one = new Blob(constrain(ax, lo, width - lo), constrain(ay, lo, height - lo), r, b.col);
+  const two = new Blob(constrain(bx, lo, width - lo), constrain(by, lo, height - lo), r, b.col);
+
+  const shove = 1.5;
+  for (let i = 0; i < N; i++) {
+    one.xLast[i] = one.x[i] - (vx - ux * shove);
+    one.yLast[i] = one.y[i] - (vy - uy * shove);
+    two.xLast[i] = two.x[i] - (vx + ux * shove);
+    two.yLast[i] = two.y[i] - (vy + uy * shove);
+  }
+
+  one.own = b.own ? { ...b.own } : null;
+  two.own = b.own ? { ...b.own } : null;
+
+  if (grabbed === b) grabbed = null;
+  blobs[index] = one;
+  blobs.push(two);
+}
+
+
+// what a blob actually uses: its own if you edited it (stays after turning the toggle off)
+// or the side menu one
+function pick(b, key, globalValue) {
+  return b.own ? b.own[key] : globalValue;
+}
+
+// popup over a blob, same sliders as the side menu but just for that blob
+// follows the blob with a bit of lag so it doesnt shake
+function layoutPopup(b) {
+  const p = b.popup();
+  let cx = 0, top = Infinity;
+  for (let i = 0; i < N; i++) {
+    cx += b.x[i];
+    if (b.y[i] < top) top = b.y[i];
+  }
+  cx /= N;
+  const lo = showMenu ? PANEL_W + 6 : 4;
+  const tx = constrain(cx / uiScale - POP_W / 2, lo, Math.max(lo, width / uiScale - POP_W - 4));
+  const ty = Math.max(4, top / uiScale - POP_H - 8);
+  if (!p.ready) {
+    p.x = tx;
+    p.y = ty;
+    p.ready = true;
+  } else {
+    p.x += (tx - p.x) * 0.35;
+    p.y += (ty - p.y) * 0.35;
+  }
+
+  const v = [pick(b, "blobness", blobness), pick(b, "gravity", gravity),
+             pick(b, "outline", outlineScale), pick(b, "solidity", solidity)];
+  p.sliders.forEach((sl, i) => {
+    sl.x = p.x + 12;
+    sl.y = p.y + 22 + i * 30;
+    sl.value = v[i];
+  });
+}
+
+function drawPopups() {
+  ctx.save();
+  ctx.scale(uiScale, uiScale);
+  for (const b of blobs) {
+    layoutPopup(b);
+    const p = b.pop;
+    ctx.fillStyle = GRAY;
+    ctx.fillRect(p.x, p.y, POP_W, POP_H);
+    ctx.strokeStyle = "rgb(60,60,60)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(p.x, p.y, POP_W, POP_H);
+    for (const sl of p.sliders) sl.display();
+  }
+  ctx.restore();
+}
+
+// touching a popup slider = blob gets its own settings
+function applyPopup(b) {
+  const v = b.pop.sliders.map((sl) => sl.value);
+  b.own = { blobness: v[0], gravity: v[1], outline: v[2], solidity: v[3] };
+}
+
+// true if you clicked a popup, so the blob under it doesnt get grabbed
+function popupDown(ux, uy) {
+  for (let i = blobs.length - 1; i >= 0; i--) {
+    const b = blobs[i], p = b.pop;
+    if (!p || !p.ready) continue;
+    if (ux < p.x || ux > p.x + POP_W || uy < p.y || uy > p.y + POP_H) continue;
+    for (const sl of p.sliders) {
+      if (sl.hit(ux, uy)) {
+        sl.dragging = true;
+        sl.setFromMouse(ux);
+        applyPopup(b);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function togglePin() {
+  // mouse over a pin? remove it
+  let pinBlob = null, pinIndex = -1, best = 18;
+  for (const b of blobs) {
+    for (let i = 0; i < N; i++) {
+      if (!b.pinned[i]) continue;
+      const d = dist(mouseX, mouseY, b.px[i], b.py[i]);
+      if (d < best) {
+        best = d;
+        pinBlob = b;
+        pinIndex = i;
+      }
+    }
+  }
+  if (pinBlob !== null) {
+    pinBlob.pinned[pinIndex] = 0;
+    return;
+  }
+
+  // else pin the point youre holding
+  if (grabbed !== null) {
+    grabbed.pinned[grabIndex] = 1;
+    grabbed.px[grabIndex] = grabbed.x[grabIndex];
+    grabbed.py[grabIndex] = grabbed.y[grabIndex];
+  }
+}
+
+function resetSettings() {
+  for (const s of sliders) s.reset();
+  individual = false;
+  bIndividual.on = false;
+  for (const b of blobs) b.own = null;
+  showFace = true;
+  bFace.on = true;
+  mitosis = false;
+  bMitosis.on = false;
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen?.();
+  else document.documentElement.requestFullscreen?.()?.catch(() => {});
+}
+
+
+function overPanel(mx) {
+  return showMenu && mx < PANEL_W;
+}
+
+function drawPanel() {
+  ctx.save();
+  ctx.scale(uiScale, uiScale);
+
+  if (!showMenu) {
+    bShow.display();
+    ctx.restore();
+    return;
+  }
+
+  ctx.fillStyle = GRAY;
+  ctx.fillRect(0, 0, PANEL_W, height / uiScale);
+
+  for (const s of sliders) s.display();
+
+  for (const b of buttons) b.display();
+
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(16, 200, 248, 57);
+  ctx.fillStyle = "#000";
+  ctx.font = "11px " + FONT;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText("drag to grab    right click to paint", 24, 212);
+  ctx.fillText("N new blob    H menu    F fullscreen", 24, 229);
+  ctx.fillText("L pin point (hover + L to unpin)", 24, 246);
+
+  ctx.font = "bold 15px " + FONT;
+  ctx.fillStyle = "#fff";
+  ctx.fillText("new blob color", 16, 433);
+  ctx.fillText("background color", 16, 585);
+
+  ctx.fillStyle = css(newColor());
+  ctx.fillRect(242, 422, 22, 22);
+  ctx.fillStyle = css(bgColor());
+  ctx.fillRect(242, 574, 22, 22);
+  ctx.strokeStyle = "#000";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(242, 422, 22, 22);
+  ctx.strokeRect(242, 574, 22, 22);
+
+  ctx.restore();
+}
+
+
+function update() {
+  blobness = sBlob.value;
+  gravity = sGrav.value;
+  outlineScale = sOutline.value;
+  solidity = sSolid.value;
+  wallInset = Math.max(0, Math.min(sWalls.value, (Math.min(width, height) - 100) / 2));
+
+  for (let s = 0; s < SUBSTEPS; s++) {
+    for (const b of blobs) b.integrate();
+    if (grabbed !== null) pullGrabbed();
+    for (const b of blobs) {
+      b.fixPerimeter();
+      b.keepArea();
+      b.holdShape();
+    }
+    for (let i = 0; i < blobs.length; i++) {
+      for (let j = i + 1; j < blobs.length; j++) {
+        pushOut(blobs[i], blobs[j]);
+        pushOut(blobs[j], blobs[i]);
+      }
+    }
+    for (const b of blobs) b.collideWithWalls();
+    for (const b of blobs) b.keepPins();
+  }
+
+  if (mitosis) checkMitosis();
+}
+
+function render() {
+  frameCount++;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = css(bgColor());
+  ctx.fillRect(0, 0, width, height);
+
+  if (wallInset > 1) {
+    ctx.strokeStyle = "rgb(120,120,120)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(wallInset, wallInset, width - 2 * wallInset, height - 2 * wallInset);
+  }
+
+  for (let i = 0; i < blobs.length; i++) blobs[i].display(i);
+  for (const b of blobs) b.drawPins();
+  if (individual) drawPopups();
+  drawPanel();
+
+  canvas.style.cursor = grabbed ? "grabbing" : (!overPanel(mouseX / uiScale, mouseY / uiScale) && blobUnderMouse() ? "grab" : "default");
+}
+
+let last = 0;
+let acc = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  acc += dt;
+  let steps = 0;
+  // 60hz updates, max 4 per frame so a tab in the background doesnt freak out after
+  while (acc >= 1 / 60 && steps < 4) {
+    update();
+    acc -= 1 / 60;
+    steps++;
+  }
+  if (steps === 4) acc = 0;
+  render();
+}
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  width = window.innerWidth;
+  height = window.innerHeight;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  canvas.style.width = width + "px";
+  canvas.style.height = height + "px";
+  uiScale = Math.max(0.5, Math.min(1, height / 743));
+}
+
+
+function setMouse(e) {
+  mouseX = e.clientX;
+  mouseY = e.clientY;
+}
+
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+canvas.addEventListener("pointerdown", (e) => {
+  setMouse(e);
+  canvas.setPointerCapture(e.pointerId);
+  const ux = mouseX / uiScale;
+  const uy = mouseY / uiScale;
+
+  if (!showMenu && bShow.over(ux, uy)) {
+    showMenu = true;
+    return;
+  }
+
+  if (overPanel(ux, uy)) {
+    for (const s of sliders) {
+      if (s.hit(ux, uy)) {
+        s.dragging = true;
+        s.setFromMouse(ux);
+      }
+    }
+    if (bAdd.over(ux, uy)) addRandomBlob();
+    if (bRemove.over(ux, uy) && blobs.length > 0) {
+      const lastBlob = blobs[blobs.length - 1];
+      if (lastBlob === grabbed) grabbed = null;
+      blobs.pop();
+    }
+    if (bClear.over(ux, uy)) {
+      grabbed = null;
+      blobs.length = 0;
+    }
+    if (bHide.over(ux, uy)) showMenu = false;
+    if (bIndividual.over(ux, uy)) {
+      individual = !individual;
+      bIndividual.on = individual;
+      for (const b of blobs) if (b.pop) b.pop.ready = false;
+    }
+    if (bReset.over(ux, uy)) resetSettings();
+    if (bMitosis.over(ux, uy)) {
+      mitosis = !mitosis;
+      bMitosis.on = mitosis;
+    }
+    if (bFace.over(ux, uy)) {
+      showFace = !showFace;
+      bFace.on = showFace;
+    }
+    return;
+  }
+
+  if (individual && popupDown(ux, uy)) return;
+
+  const b = blobUnderMouse();
+  if (b === null) return;
+
+  if (e.button === 2) {
+    b.col = newColor();
+    return;
+  }
+
+  grabbed = b;
+  let best = 999999;
+  for (let i = 0; i < N; i++) {
+    const d = dist(mouseX, mouseY, b.x[i], b.y[i]);
+    if (d < best) {
+      best = d;
+      grabIndex = i;
+    }
+  }
+  grabOffX = b.x[grabIndex] - mouseX;
+  grabOffY = b.y[grabIndex] - mouseY;
+});
+
+canvas.addEventListener("click", (e) => {
+  if (showMenu && bFull.over(e.clientX / uiScale, e.clientY / uiScale)) toggleFullscreen();
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  setMouse(e);
+  for (const s of sliders) {
+    if (s.dragging) s.setFromMouse(mouseX / uiScale);
+  }
+  for (const b of blobs) {
+    if (!b.pop) continue;
+    for (const sl of b.pop.sliders) {
+      if (!sl.dragging) continue;
+      sl.setFromMouse(mouseX / uiScale);
+      applyPopup(b);
+    }
+  }
+});
+
+function release() {
+  grabbed = null;
+  for (const s of sliders) s.dragging = false;
+  for (const b of blobs) {
+    if (b.pop) for (const sl of b.pop.sliders) sl.dragging = false;
+  }
+}
+canvas.addEventListener("pointerup", release);
+canvas.addEventListener("pointercancel", release);
+
+window.addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  if (e.key.length === 1) {
+    // last 7 keys, same length as awesome
+    typed = (typed + e.key.toLowerCase()).slice(-7);
+    if (typed === "awesome") {
+      rainbowMode = !rainbowMode;
+      typed = "";
+    }
+  }
+
+  const k = e.key.toLowerCase();
+  if (k === "f") toggleFullscreen();
+  if (k === "h") showMenu = !showMenu;
+  if (k === "l") togglePin();
+
+  if (k === "n") {
+    if (overPanel(mouseX / uiScale, mouseY / uiScale)) addRandomBlob();
+    else addBlob(mouseX, mouseY, sSize.value, newColor());
+  }
+});
+
+window.addEventListener("resize", resize);
+resize();
+
+addBlob(width / 2, height - startRadius - 2, startRadius, [255, 255, 0]);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+
+   //verity game #imsofunny
