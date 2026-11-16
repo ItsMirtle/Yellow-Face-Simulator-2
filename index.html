@@ -1245,9 +1245,11 @@ const playBtn = document.getElementById("play");
 let menuUp = true;
 let leaving = false;
 
-// keys shouldnt do anything in the game while the menu is up
+// keys shouldnt do anything in the game while the menu is up, except f for fullscreen
 window.addEventListener("keydown", (e) => {
-  if (menuUp) e.stopPropagation();
+  if (!menuUp) return;
+  e.stopPropagation();
+  if (e.key.toLowerCase() === "f" && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) toggleFullscreen();
 }, true);
 
 // music, both loop and stay quiet. DL for the menu, SOTI for the game
@@ -1256,8 +1258,8 @@ const menuSong = new Audio("DL.mp3");
 const gameSong = new Audio("SOTI.mp3");
 menuSong.loop = true;
 gameSong.loop = true;
-const MENU_VOL = 0.2;
-const GAME_VOL = 0.24;
+const MENU_VOL = 0.07;
+const GAME_VOL = 0.085;
 
 // moves a songs volume to goal over ms, with an ease
 function fadeTo(song, goal, ms, done) {
