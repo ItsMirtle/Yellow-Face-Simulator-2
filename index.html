@@ -275,8 +275,9 @@ const bFull = new Button("fullscreen", 16, 128, 120, 30, "blue");
 const bHide = new Button("hide menu", 144, 128, 120, 30, "blue");
 const bIndividual = new Button("individual editing", 16, 164, 248, 30, "toggle");
 const bReset = new Button("reset settings", 16, 691, 248, 34, "red");
+const bBack = new Button("back to menu", 16, 731, 248, 34, "blue");
 const bShow = new Button("menu", 10, 10, 76, 30, "blue");
-const buttons = [bAdd, bRemove, bClear, bFace, bMitosis, bFull, bHide, bIndividual, bReset];
+const buttons = [bAdd, bRemove, bClear, bFace, bMitosis, bFull, bHide, bIndividual, bReset, bBack];
 bFace.on = true;
 
 const newColor = () => hsb(sHue.value, sSat.value, sBri.value);
@@ -1081,7 +1082,7 @@ function resize() {
   canvas.height = Math.round(height * dpr);
   canvas.style.width = width + "px";
   canvas.style.height = height + "px";
-  uiScale = Math.max(0.5, Math.min(1, height / 743));
+  uiScale = Math.max(0.5, Math.min(1, height / 783));
 }
 
 
@@ -1092,6 +1093,11 @@ function setMouse(e) {
   // menu hides when the mouse is far from the left and comes back when it gets close
   // (not while a side slider is being dragged)
   if (sliders.some((sl) => sl.dragging)) return;
+  // holding a blob, the menu stays away (it gets in the way)
+  if (grabbed !== null) {
+    menuNear = false;
+    return;
+  }
   const ux = mouseX / uiScale;
   if (ux < 120) menuNear = true;
   else if (ux > PANEL_W + 40) menuNear = false;
@@ -1134,6 +1140,7 @@ canvas.addEventListener("pointerdown", (e) => {
       for (const b of blobs) if (b.pop) b.pop.ready = false;
     }
     if (bReset.over(ux, uy)) resetSettings();
+    if (bBack.over(ux, uy)) backToMenu();
     if (bMitosis.over(ux, uy)) {
       mitosis = !mitosis;
       bMitosis.on = mitosis;
@@ -1265,7 +1272,9 @@ const GAME_VOL = 0.085;
 function fadeTo(song, goal, ms, done) {
   const from = song.volume;
   const t0 = performance.now();
+  const id = song.fadeId = (song.fadeId || 0) + 1; // a newer fade on the same song cancels this one
   function tick() {
+    if (song.fadeId !== id) return;
     const t = Math.min((performance.now() - t0) / ms, 1);
     song.volume = from + (goal - from) * t * t * (3 - 2 * t);
     if (t < 1) requestAnimationFrame(tick);
@@ -1322,10 +1331,32 @@ playBtn.addEventListener("click", () => {
   setTimeout(() => {
     menu.style.display = "none";
     menuUp = false;
-    addStartBlob();
+    leaving = false;
+    if (blobs.length === 0) addStartBlob();
     fade.style.opacity = 0;
   }, 200 + 700 + 100);
 });
+
+// back to the main menu, same kind of transition as play but the other way around
+// what you made stays there, play just keeps going
+function backToMenu() {
+  if (menuUp || leaving) return;
+  leaving = true;
+
+  fadeTo(gameSong, 0, 1200, () => gameSong.pause());
+  menuSong.volume = 0;
+  menuSong.play().catch(() => {});
+  fadeTo(menuSong, MENU_VOL, 2500);
+
+  fade.style.opacity = 1;
+  setTimeout(() => {
+    menu.style.display = "block";
+    menuUp = true;
+    playBtn.classList.remove("down");
+    leaving = false;
+    fade.style.opacity = 0;
+  }, 700 + 100);
+}
 </script>
 </body>
 </html>
